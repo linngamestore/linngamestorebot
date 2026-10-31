@@ -1,0 +1,12 @@
+# Repo: linngamestore/linngamestorebot   (put this file next to your .js as wrangler.toml)
+name = "linngamestore"              # MUST equal the Worker name in the dashboard (linngamestore.linngamestore.workers.dev)
+main = "linngamestorebot.js"        # <- your file name in the repo
+compatibility_date = "2025-09-01"
+
+[triggers]
+crons = ["*/2 * * * *"]
+
+# Service binding to the order bot (Worker -> Worker calls on the same account)
+[[services]]
+binding = "ORDER_WORKER"
+service = "linnmanagebot"
