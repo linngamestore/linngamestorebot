@@ -682,12 +682,19 @@ const BTN_FONT_PX = 33.8;
 const BTN_PAD_PX = 228;
 const BTN_BRAILLE_PX = 25.1;
 const BTN_SPACE_PX = 8.5;
-const BTN_ROW_PX = 940;
+// BTN_ROW_PX is deliberately a little WIDER than the real bubble (BTN_BUBBLE_PX = inner bubble width on a 1080px phone).
+// Same trick as PCASTORE: every row is padded to this ONE overflow width, so Telegram squeezes every row down to the
+// bubble width by shrinking the pill padding. Result: tab chips, game grid, Prev/Next, Back/Stop and single buttons all
+// share exactly the same left + right edge, even when the label-width estimate is a few px off.
+const BTN_ROW_PX = 1010;
+const BTN_BUBBLE_PX = 970;
 const BTN_GAP_PX = 20;
+const BTN_ICON_PX = 33;   // extra width of the little arrow icon Telegram draws on url / web_app buttons
+const btnIconPx = (b) => (b && (b.url || b.web_app) ? BTN_ICON_PX : 0);
 // When a row is wider than the bubble, Telegram shrinks every pill by the SAME amount, taking it from the pill's own
 // padding (measured: 228px -> ~45px in a 3-button row). So a column count fits as long as the label TEXT plus this
 // minimum padding fits its slot; equal natural widths (evenRows) then stay equal after the shrink.
-const BTN_MIN_PAD_PX = 44;
+const BTN_MIN_PAD_PX = 98;
 function glyphEm(cp, ch) {
   if (cp === 0x2800) return BTN_BRAILLE_PX / BTN_FONT_PX;
   if (cp === 32) return 0.25;
@@ -719,11 +726,12 @@ function glyphEm(cp, ch) {
   if (ch >= 'A' && ch <= 'Z') return 0.65;
   return 0.54;
 }
-function textPx(label) {
+function textPxOld(label) {
   let em = 0;
   for (const ch of String(label || '').replace(Q_MARKER_RE, '')) em += glyphEm(ch.codePointAt(0), ch);
   return em * BTN_FONT_PX;
 }
+function textPx(label) { return BTN_PX_PER_EM * btnEm(label); }
 // Pad one label to `targetPx` of natural button width (label centred). Labels already wider are left alone.
 function padLabelPx(text, targetPx) {
   const free = targetPx - BTN_PAD_PX - textPx(text);
@@ -742,26 +750,60 @@ function padLabelPx(text, targetPx) {
 // smallest width in which every row's widest label still fits (capped at BTN_ROW_PX), so nothing is stretched more
 // than it has to be: a keyboard of short labels stays narrow, one with long names / 2-column rows uses the full width.
 // `widthPx` lets a caller (the tap spinner) keep the width the keyboard already has.
-function evenRowsWidth(rows) {
-  let W = 0;
-  for (const r of Array.isArray(rows) ? rows : []) {
-    if (!Array.isArray(r) || !r.length) continue;
-    const n = Math.min(r.length, 8);
-    const widest = Math.max(...r.slice(0, n).map((b) => BTN_PAD_PX + textPx((b && b.text) || '')));
-    W = Math.max(W, n * widest + (n - 1) * BTN_GAP_PX);
+function evenRowsWidth(rows) { return BTN_ROW_PX; }
+
+// ---- PCASTORE's calibrated width model (measured on a real 1080px phone, known to line up there) ----
+//   button width (px) = BTN_PX_PER_EM * text width (em) + BTN_PAD2_PX   (+ BTN_ICON_PX for url / web_app buttons)
+const BTN_FILL = '\u2800';
+const BTN_PX_PER_EM = 44.3;
+const BTN_PAD2_PX = 77.5;
+const BTN_FILL_EM = 0.673;
+const BTN_SPACE_EM = 0.278;
+const BTN_EM_ASCII = [278,278,355,556,556,889,667,191,333,333,389,584,278,333,278,278,556,556,556,556,556,556,556,556,556,556,278,278,584,584,584,556,1015,667,667,722,722,667,611,778,722,278,500,667,556,833,722,778,667,778,722,667,611,722,667,944,667,667,611,278,278,278,469,556,333,556,556,500,556,556,278,556,556,222,222,500,222,833,556,556,556,556,333,500,278,556,500,722,500,500,500,334,260,334,584];
+function btnEm(s) {
+  let w = 0;
+  for (const ch of Array.from(String(s || '').replace(Q_MARKER_RE, ''))) {
+    const c = ch.codePointAt(0);
+    if (ch === BTN_FILL) w += BTN_FILL_EM;
+    else if (c >= 32 && c <= 126) w += BTN_EM_ASCII[c - 32] / 1000;
+    else if (ch === '\u00b7') w += 0.333;
+    else if (ch === '\u2007') w += 0.556;
+    else if (ch === '\u2008') w += 0.278;
+    else if (ch === '\u2026' || ch === '\u2014') w += 1;
+    else if (c === 0x103c) w += 0.6;
+    else if (c === 0x103b) w += 0.5;
+    else if (c === 0x1031 || c === 0x102c || c === 0x102b || c === 0x1038) w += 0.22;
+    else if (/[\u102d-\u1030\u1032-\u103a\u103d\u103e\u1056-\u1059\u105e-\u1060\u1062-\u1064\u1067-\u106d\u1071-\u1074\u1082-\u108d\u108f\u109a-\u109d]/.test(ch)) continue;
+    else w += 0.9;
   }
-  return Math.min(W, BTN_ROW_PX);
+  return w;
 }
-function evenRows(rows, widthPx) {
+const btnNaturalPx = (b) => BTN_PX_PER_EM * btnEm(b && b.text) + BTN_PAD2_PX + btnIconPx(b);
+function padToEm(text, targetEm) {
+  const gap = targetEm - btnEm(text);
+  if (gap < 0.25) return text;
+  let k = Math.floor(gap / BTN_FILL_EM);
+  const rem = gap - k * BTN_FILL_EM;
+  let m = Math.round(rem / BTN_SPACE_EM);
+  if (Math.abs(BTN_FILL_EM - rem) < Math.abs(rem - m * BTN_SPACE_EM)) { k += 1; m = 0; }
+  if (k === 0) { if (gap < BTN_FILL_EM / 2) return text; k = 1; m = 0; }
+  const a = Math.ceil(k / 2), b = k - a;
+  const sl = b ? Math.ceil(m / 2) : m, sr = m - sl;
+  return BTN_FILL.repeat(a) + ' '.repeat(sl) + text + ' '.repeat(sr) + BTN_FILL.repeat(b);
+}
+// every button of a row = same width; every row padded to the ONE overflow width BTN_ROW_PX so Telegram squeezes
+// them all to the bubble width (same left / right edge everywhere).
+function evenRows(rows) {
   if (!Array.isArray(rows)) return rows;
-  const W = Number(widthPx) || evenRowsWidth(rows);
-  return rows.map((r) => {
+  const clean = (b) => (b && typeof b.text === 'string'
+    ? { ...b, text: b.text.replace(/^[\u2800 ]+|[\u2800 ]+$/g, '') || b.text } : b);   // drop filler from an earlier pass
+  const src = rows.map((r) => (Array.isArray(r) ? r.slice(0, 8).map(clean) : r));
+  const rowMax = src.map((r) => (Array.isArray(r) && r.length ? Math.max(...r.map(btnNaturalPx)) : 0));
+  return src.map((r, i) => {
     if (!Array.isArray(r) || !r.length) return r;
-    const n = Math.min(r.length, 8);
-    const slot = Math.floor((W - (n - 1) * BTN_GAP_PX) / n);
-    const nat = r.slice(0, n).map((b) => BTN_PAD_PX + textPx((b && b.text) || ''));
-    const target = Math.max(slot, ...nat);   // equal inside the row; only wider than its share if a label really needs it
-    return r.map((b, i) => (i >= n || !b || typeof b.text !== 'string') ? b : { ...b, text: padLabelPx(b.text, target) });
+    const per = Math.max(rowMax[i], (BTN_ROW_PX - (r.length - 1) * BTN_GAP_PX) / r.length);
+    return r.map((b) => (b && typeof b.text === 'string'
+      ? { ...b, text: padToEm(b.text, (per - BTN_PAD2_PX - btnIconPx(b)) / BTN_PX_PER_EM) } : b));
   });
 }
 
@@ -5904,7 +5946,7 @@ function buyCut(text, maxPx) {
   for (const ch of Array.from(s)) { if (textPx(out + ch + '…') > maxPx) break; out += ch; }
   return out.trimEnd() + '…';
 }
-const buySlotPx = (cols) => Math.floor((BTN_ROW_PX - (cols - 1) * BTN_GAP_PX) / cols);
+const buySlotPx = (cols) => Math.floor((BTN_BUBBLE_PX - (cols - 1) * BTN_GAP_PX) / cols);
 // Columns for the type tabs: up to 3 per row; buyGrid() drops the count if the labels do not fit.
 function buyTabCols(n) { return n <= 3 ? n : n === 4 ? 2 : 3; }
 function buyGrid(btns, cols) {
