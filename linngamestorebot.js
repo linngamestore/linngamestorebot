@@ -666,30 +666,82 @@ function padBubble(text, minWidth = BUBBLE_MIN_WIDTH) {
   return lines.join('\n');
 }
 
-// Even button rows. Buttons inside a rich message are drawn as pills only as wide as their label, so rows of
-// different label lengths (or 1 / 2 / 3 buttons per row) look ragged. evenRows() pads every label with invisible
-// Braille blanks so that (a) every button in a row is the same width and (b) EVERY row has the same total width,
-// EVEN_ROW_TARGET, which is a little wider than the bubble. Telegram then squeezes each row to exactly the bubble
-// width, so all rows (grid, tabs, Prev | 1/3 | Next, a lone Back / Stop) share one left and one right edge.
-// Only the invisible filler overflows. Labels only: callbacks, styles and URLs are untouched, and the classic
-// (non-rich) keyboard is never padded. Raise EVEN_ROW_TARGET if rows look narrower than the bubble, lower it if
-// label text starts to get clipped.
-const EVEN_ROW_TARGET = 30;   // total label width of one button row: fills the bubble but stays INSIDE it (44 overflowed -> clipped/skewed text)
+// Even button rows (rich in-message buttons only - the classic keyboard is never used for these).
+// A rich button is drawn as a pill whose natural width = BTN_PAD_PX + the real width of its label. Counting
+// characters (the old way) is wrong because "i" and "W", digits and Burmese letters all have different widths, which
+// is exactly why short and long buttons looked different. So the label width is now ESTIMATED IN PIXELS per glyph
+// (textPx) and every label is padded with invisible Braille blanks (+ a few normal spaces for the fine remainder)
+// until ALL buttons of a row have the same natural width, and every row has the same total width (BTN_ROW_PX).
+// The constants were fitted to real Telegram screenshots of this bot (label widths matched within ~1%).
+//   BTN_FONT_PX    : button font size            BTN_PAD_PX : pill's own left+right padding
+//   BTN_BRAILLE_PX : width of one U+2800 blank   BTN_SPACE_PX : width of one normal space
+//   BTN_ROW_PX     : total width of one button row (1 button = this wide, 2 buttons = half each, ...)
+// If rows look narrower than the bubble raise BTN_ROW_PX; if text starts to clip lower it.
+const EVEN_ROW_TARGET = 30;   // legacy name, no longer used for layout
+const BTN_FONT_PX = 33.8;
+const BTN_PAD_PX = 228;
+const BTN_BRAILLE_PX = 25.1;
+const BTN_SPACE_PX = 8.5;
+const BTN_ROW_PX = 940;
+const BTN_GAP_PX = 20;
+function glyphEm(cp, ch) {
+  if (cp === 0x2800) return BTN_BRAILLE_PX / BTN_FONT_PX;
+  if (cp === 32) return 0.25;
+  if (cp >= 0x30 && cp <= 0x39) return 0.56;
+  if (cp >= 0x1000 && cp <= 0x109f) {                       // Burmese
+    if (cp === 0x1031) return 0.5;                           // ေ
+    if (cp === 0x102b || cp === 0x102c) return 0.45;         // ါ ာ
+    if (cp === 0x102f || cp === 0x1030) return 0.4;          // ု ူ
+    if (cp >= 0x103b && cp <= 0x103e) return 0.4;            // medials
+    if (cp === 0x1038) return 0.3;                           // း
+    if ((cp >= 0x102d && cp <= 0x1037) || cp === 0x1039 || cp === 0x103a) return 0;   // vowel/tone marks, asat
+    return 1.05;                                             // consonants / digits
+  }
+  if (cp >= 0x1f000 || (cp >= 0x2600 && cp <= 0x27bf)) return 1.2;   // emoji
+  if (cp === 0x2014) return 0.89;
+  if (cp === 0x2013) return 0.56;
+  if (cp === 0xb7 || cp === 0x2039 || cp === 0x203a) return 0.3;
+  if (cp === 0x2022) return 0.38;
+  if (cp === 0x2026) return 0.9;
+  if ('.,:;\'`!|'.includes(ch)) return 0.27;
+  if ('ilI'.includes(ch)) return 0.26;
+  if ('jtfr'.includes(ch)) return 0.34;
+  if ('()[]{}'.includes(ch)) return 0.32;
+  if (ch === '-') return 0.28;
+  if (ch === '/') return 0.4;
+  if ('mM'.includes(ch)) return 0.87;
+  if ('wW'.includes(ch)) return 0.8;
+  if (ch === '%') return 0.78;
+  if (ch >= 'A' && ch <= 'Z') return 0.65;
+  return 0.54;
+}
+function textPx(label) {
+  let em = 0;
+  for (const ch of String(label || '').replace(Q_MARKER_RE, '')) em += glyphEm(ch.codePointAt(0), ch);
+  return em * BTN_FONT_PX;
+}
+// Pad one label to `targetPx` of natural button width (label centred). Labels already wider are left alone.
+function padLabelPx(text, targetPx) {
+  const free = targetPx - BTN_PAD_PX - textPx(text);
+  const K = Math.floor(free / BTN_BRAILLE_PX);        // whole Braille blanks
+  if (K < 1) return text;
+  const S = Math.min(3, Math.round((free - K * BTN_BRAILLE_PX) / BTN_SPACE_PX));   // normal spaces for the remainder
+  const bl = Math.ceil(K / 2), br = Math.floor(K / 2);
+  // normal spaces only go next to the text and never at the very edge (Telegram trims edge spaces),
+  // so a side with no Braille blank gets none and its share moves to the other side.
+  let sl = Math.ceil(S / 2), sr = Math.floor(S / 2);
+  if (br === 0) { sl += sr; sr = 0; }
+  return BRAILLE_BLANK.repeat(bl) + ' '.repeat(sl) + text + ' '.repeat(sr) + BRAILLE_BLANK.repeat(br);
+}
 function evenRows(rows) {
-  const ok = (Array.isArray(rows) ? rows : []).filter((r) => Array.isArray(r) && r.length);
-  if (!ok.length) return rows;
-  const rowW = (r) => Math.max(...r.slice(0, 8).map((b) => visualWidth((b && b.text) || '')));
+  if (!Array.isArray(rows)) return rows;
   return rows.map((r) => {
     if (!Array.isArray(r) || !r.length) return r;
     const n = Math.min(r.length, 8);
-    const w = Math.max(rowW(r), Math.floor(EVEN_ROW_TARGET / n));   // every button in the row = same width, whole row = EVEN_ROW_TARGET (never wider than the bubble)
-    return r.map((b, i) => {
-      if (i >= n || !b || typeof b.text !== 'string') return b;
-      const gap = w - visualWidth(b.text);
-      if (gap <= 0) return b;
-      const l = Math.floor(gap / 2);
-      return { ...b, text: BRAILLE_BLANK.repeat(l) + b.text + BRAILLE_BLANK.repeat(gap - l) };
-    });
+    const slot = Math.floor((BTN_ROW_PX - (n - 1) * BTN_GAP_PX) / n);
+    const nat = r.slice(0, n).map((b) => BTN_PAD_PX + textPx((b && b.text) || ''));
+    const target = Math.max(slot, ...nat);            // every button of the row gets the same natural width
+    return r.map((b, i) => (i >= n || !b || typeof b.text !== 'string') ? b : { ...b, text: padLabelPx(b.text, target) });
   });
 }
 
@@ -1014,7 +1066,7 @@ function startButtonSpinner(token, cb, opts = {}) {
     const call = (n) => {                                // n = frame number, or null = put the original buttons back
       const f = mapBtn(n);
       const body = rich
-        ? { chat_id, message_id, rich_message: { blocks: rich.blocks.map((b) => (isBtns(b) ? { ...b, buttons: b.buttons.map(f) } : b)) } }
+        ? { chat_id, message_id, rich_message: { blocks: rich.blocks.map((b) => (isBtns(b) ? { ...b, buttons: evenRows([b.buttons.map(f)])[0] } : b)) } }
         : { chat_id, message_id, reply_markup: { inline_keyboard: kb.map((row) => row.map(f)) } };
       return fetch(`https://api.telegram.org/bot${token}/${rich ? "editMessageText" : "editMessageReplyMarkup"}`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -5819,29 +5871,28 @@ async function buyReadResume(env, telegramId) {
 async function buyAbort(env, chatId, telegramId) { await deleteFlowMessages(env, chatId); await clearBotSession(env, telegramId); }
 
 // ---- UI helpers ---------------------------------------------------------------
-// In-message (rich) buttons are drawn as pills as wide as their text, so a grid looks ragged. Every label in a
-// group is padded with invisible Braille blanks (U+2800, never trimmed) to the width of the longest one, so all
-// pills in that group come out the same size. Labels longer than `cap` are left alone.
-function buyEq(btns) { return btns; }   // equal widths are produced once, by evenRows(), when the rich buttons are built
-function buyCut(text, max) {
+// In-message (rich) buttons: equal widths are produced by evenRows() (pixel model above). buyGrid() only decides how
+// many columns really FIT: a column count is used only if the widest label's natural width fits its slot, otherwise
+// the whole grid drops to fewer columns (so one long name never makes the others look different).
+function buyEq(btns) { return btns; }
+function buyCut(text, maxPx) {
   const s = String(text || '');
-  if (visualWidth(s) <= max) return s;
+  if (textPx(s) <= maxPx) return s;
   let out = '';
-  for (const ch of Array.from(s)) { if (visualWidth(out + ch) > max - 1) break; out += ch; }
+  for (const ch of Array.from(s)) { if (textPx(out + ch + '…') > maxPx) break; out += ch; }
   return out.trimEnd() + '…';
 }
-// Columns for the type tabs: short labels fill the whole row (up to 3 per row; 4 tabs = 2 x 2).
+const buySlotPx = (cols) => Math.floor((BTN_ROW_PX - (cols - 1) * BTN_GAP_PX) / cols);
+// Columns for the type tabs: up to 3 per row; buyGrid() drops the count if the labels do not fit.
 function buyTabCols(n) { return n <= 3 ? n : n === 4 ? 2 : 3; }
-// Grid of `cols` columns. A row never gets wider than EVEN_ROW_TARGET, so instead of cutting names or letting the row
-// overflow the bubble, the grid drops to fewer columns when the longest label does not fit; one long button then
-// spans a full row. evenRows() later pads every button of a row to the same width.
 function buyGrid(btns, cols) {
   const isPh = (b) => b && b.text === '·' && b.callback_data === 'bg:n';
   const real = btns.filter((b) => !isPh(b));
-  const widest = Math.max(0, ...real.map((b) => visualWidth(b.text)));
-  while (cols > 1 && widest > Math.floor(EVEN_ROW_TARGET / cols) - 2) cols--;
+  if (real.length < 2) cols = 1;
+  const widest = Math.max(0, ...real.map((b) => BTN_PAD_PX + textPx(b.text)));
+  while (cols > 1 && widest > buySlotPx(cols)) cols--;
   const use = cols === 1 ? real : btns;                 // placeholders only keep a 2-wide last row tidy
-  const cap = Math.floor(EVEN_ROW_TARGET / cols) - 2;
+  const cap = buySlotPx(cols) - BTN_PAD_PX;
   const eq = use.map((b) => ({ ...b, text: buyCut(b.text, cap) }));
   const rows = [];
   for (let i = 0; i < eq.length; i += cols) rows.push(eq.slice(i, i + cols));
@@ -5850,9 +5901,9 @@ function buyGrid(btns, cols) {
 function buyNav(lang, page, pages, cb) {
   if (pages <= 1) return null;
   return [
-    page > 0 ? { text: btn(lang, 'prev'), callback_data: cb(page - 1) } : { text: '·', callback_data: 'bg:n' },
+    page > 0 ? { text: '‹', callback_data: cb(page - 1) } : { text: '·', callback_data: 'bg:n' },
     { text: `${page + 1}/${pages}`, callback_data: 'bg:n' },
-    page < pages - 1 ? { text: btn(lang, 'next'), callback_data: cb(page + 1) } : { text: '·', callback_data: 'bg:n' },
+    page < pages - 1 ? { text: '›', callback_data: cb(page + 1) } : { text: '·', callback_data: 'bg:n' },
   ];
 }
 // One "Stop" button for the whole in-bot buy flow: wipes every message of the flow (cards, price list, typed
@@ -6029,14 +6080,23 @@ async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live)
 
   const rows = [];
   if (tabs.length > 1) buyGrid(tabs.map((t, i) => styled({ text: `${i === ti ? '• ' : ''}${buyTabLabel(game, t)}`, callback_data: `bg:k:${gid}:${i}` }, buyTabStyle(t, i))), buyTabCols(tabs.length)).forEach((r) => rows.push(r));
-  const pkgBtns = list.slice(0, BUY_PKG_BUTTONS_MAX).map(({ p, i }) => styled({ text: `${p.amount} — ${Number(p.price || 0).toLocaleString()} Ks`, callback_data: `bg:p:${gid}:${i}` }, 'primary'));
+  // Compact labels ("1050 · 64,350", price in Ks) are tried first so the list can use 2 columns; if even those do
+  // not fit, fall back to one column with the full "1050 — 64,350 Ks" label.
+  const mkPkgBtns = (compact) => list.slice(0, BUY_PKG_BUTTONS_MAX).map(({ p, i }) => styled({
+    text: compact ? `${p.amount} · ${Number(p.price || 0).toLocaleString()}` : `${p.amount} — ${Number(p.price || 0).toLocaleString()} Ks`,
+    callback_data: `bg:p:${gid}:${i}`,
+  }, 'primary'));
+  let pkgBtns = mkPkgBtns(true);
   if (pkgBtns.length % 2 === 1 && pkgBtns.length > 1) pkgBtns.push({ text: '·', callback_data: 'bg:n' });   // keep the last row 2 wide
-  buyGrid(pkgBtns, 2).forEach((r) => rows.push(r));
+  let pkgGrid = buyGrid(pkgBtns, 2);
+  const twoCol = pkgGrid.length > 0 && pkgGrid[0].length > 1;
+  if (!twoCol) pkgGrid = buyGrid(mkPkgBtns(false), 1);
+  pkgGrid.forEach((r) => rows.push(r));
   rows.push([{ text: bt(lang, 'နောက်သို့', 'Back'), callback_data: `bg:b:${gid}` }, buyStop(lang)]);
   const lines = [`🎮 ${buyGameLabel(game)}`, ''];
   if (tabs.length > 1) lines.push(bt(lang, 'Package အမျိုးအစား ရွေးပါ ↓', 'Pick a package type ↓'), '');
   lines.push(list.length
-    ? bt(lang, 'လိုချင်တဲ့ Package ကို အောက်က ခလုတ်နှိပ်ပြီး ရွေးပါ', 'Tap the package you want below')
+    ? bt(lang, `လိုချင်တဲ့ Package ကို အောက်က ခလုတ်နှိပ်ပြီး ရွေးပါ${twoCol ? ' (ဈေးနှုန်း Ks)' : ''}`, `Tap the package you want below${twoCol ? ' (prices in Ks)' : ''}`)
     : bt(lang, 'ဒီအမျိုးအစားမှာ Package မရှိသေးပါ။', 'No packages in this type yet.'));
   const mapList = list.map(({ p, i }) => [i, String(p.amount)]);
 
