@@ -645,7 +645,7 @@ function orderStatusWord(status) {
 // "characters" wide, so bubble and buttons always line up the same way.
 // Raise BUBBLE_MIN_WIDTH for wider bubbles, lower it for narrower ones.
 // ---------------------------------------------------------------------------
-const BUBBLE_MIN_WIDTH = 34;
+const BUBBLE_MIN_WIDTH = 22;   // was 34: the filler overflowed the bubble and pushed a short title ("Game List") onto two lines
 const BRAILLE_BLANK = '\u2800';
 function visualWidth(line) {
   let w = 0;
@@ -5778,7 +5778,7 @@ function json(obj, status, headers) {
 // error 1042, see the ImgBB comment above). Optional env: ORDER_WORKER_URL.
 // ===========================================================================
 const BUY_SOFTWARE_ADMIN = 'linn270_0';
-const BUY_GAMES_PER_PAGE = 10;   // 5 rows x 2 columns
+const BUY_GAMES_PER_PAGE = 8;   // 4 rows x 2 columns (shorter card; raise to 10 for 5 rows)
 const BUY_SERVERS_PER_PAGE = 10;
 const BUY_PKGS_PER_PAGE = 8;
 const BUY_QTY_CHOICES = [1, 2, 3, 5, 10];
@@ -5950,12 +5950,12 @@ function buyCut(text, maxPx) {
 const buySlotPx = (cols) => Math.floor((BTN_BUBBLE_PX - (cols - 1) * BTN_GAP_PX) / cols);
 // Columns for the type tabs: up to 3 per row; buyGrid() drops the count if the labels do not fit.
 function buyTabCols(n) { return n <= 3 ? n : n === 4 ? 2 : 3; }
-function buyGrid(btns, cols) {
+function buyGrid(btns, cols, force) {   // force = keep `cols` columns and cut long labels with "…" instead of dropping to fewer columns
   const isPh = (b) => b && b.text === '·' && b.callback_data === 'bg:n';
   const real = btns.filter((b) => !isPh(b));
   if (real.length < 2) cols = 1;
   const widest = Math.max(0, ...real.map((b) => textPx(b.text)));
-  while (cols > 1 && widest > buySlotPx(cols) - BTN_MIN_PAD_PX) cols--;
+  while (!force && cols > 1 && widest > buySlotPx(cols) - BTN_MIN_PAD_PX) cols--;
   const use = cols === 1 ? real : btns;                 // placeholders only keep a 2-wide last row tidy
   const cap = buySlotPx(cols) - BTN_MIN_PAD_PX;
   const eq = use.map((b) => ({ ...b, text: buyCut(b.text, cap) }));
@@ -6026,8 +6026,10 @@ async function buyShowGames(env, chatId, mid, lang, cat, page) {
   const btns = groups.slice(start, start + BUY_GAMES_PER_PAGE).map((g, i) => ({
     text: g.ids.length > 1 ? `${g.name} (${g.ids.length})` : g.name,
     callback_data: `bg:g:${cat}:${page}:${start + i}`,
+    style: 'primary',
   }));
-  const rows = buyGrid(btns, 2);
+  if (btns.length > 1 && btns.length % 2) btns.push({ text: '·', callback_data: 'bg:n' });   // keep the last row 2 wide
+  const rows = buyGrid(btns, 2, true);
   const nav = buyNav(lang, page, pages, (p) => `bg:l:${cat}:${p}`);
   if (nav) rows.push(nav);
   rows.push([{ text: bt(lang, 'နောက်သို့', 'Back'), callback_data: 'bg:m' }, buyStop(lang)]);
@@ -6167,11 +6169,11 @@ async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live,
     }
     if (chips.length > 1 || pf) buyGrid(chips, chips.length).forEach((r) => rows.push(r));
   }
-  // amount-only buttons (price is shown on the confirm card): 3 per row, fewer if a label is too long, paged
-  const amountBtns = list.map(({ p, i }) => ({ text: String(p.amount), callback_data: `bg:p:${gid}:${i}`, style: 'primary' }));
+  // package buttons "amount • price Ks": 2 per row (1 if a label is too long), paged
+  const amountBtns = list.map(({ p, i }) => ({ text: `${p.amount} • ${Number(p.price || 0).toLocaleString()} Ks`, callback_data: `bg:p:${gid}:${i}`, style: 'primary' }));
   const fitsCols = (c) => amountBtns.every((x) => textPx(x.text) <= buySlotPx(c) - BTN_MIN_PAD_PX);
-  const pcols = amountBtns.length < 2 ? 1 : fitsCols(3) ? 3 : fitsCols(2) ? 2 : 1;
-  const perPage = pcols === 3 ? 9 : pcols === 2 ? 8 : 6;
+  const pcols = amountBtns.length < 2 ? 1 : fitsCols(2) ? 2 : 1;
+  const perPage = pcols === 2 ? 8 : 6;
   const pages = Math.max(1, Math.ceil(amountBtns.length / perPage));
   const pg = Math.min(Math.max(0, vw.pg || 0), pages - 1);
   const pageBtns = amountBtns.slice(pg * perPage, pg * perPage + perPage);
@@ -6183,7 +6185,7 @@ async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live,
   const lines = [`🎮 ${buyGameLabel(game)}`, ''];
   if (tabs.length > 1) lines.push(bt(lang, 'Package အမျိုးအစား ရွေးပါ ↓', 'Pick a package type ↓'), '');
   lines.push(list.length
-    ? bt(lang, 'လိုချင်တဲ့ ပမာဏကို နှိပ်ပါ (ဈေးကို နောက်အဆင့်မှာ ပြပါမယ်)', 'Tap the amount you want (the price shows on the next step)')
+    ? bt(lang, 'လိုချင်တဲ့ Package ကို အောက်က ခလုတ်နှိပ်ပြီး ရွေးပါ', 'Tap the package you want below')
     : (pf ? bt(lang, 'ဒီဈေးအပိုင်းမှာ Package မရှိပါ။', 'No packages in this price range.') : bt(lang, 'ဒီအမျိုးအစားမှာ Package မရှိသေးပါ။', 'No packages in this type yet.')));
   const mapList = list.map(({ p, i }) => [i, String(p.amount)]);
 
