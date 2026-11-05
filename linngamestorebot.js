@@ -666,23 +666,23 @@ function padBubble(text, minWidth = BUBBLE_MIN_WIDTH) {
   return lines.join('\n');
 }
 
-// Even button rows. Buttons inside a rich message are drawn as pills exactly as wide as their label, so rows of
-// different label lengths (or 1 / 2 / 3 buttons per row) look ragged. evenRows() pads labels with invisible Braille
-// blanks so that (a) every button in a row is the same width and (b) every row has about the same total width
-// (a lone "Back" matches a 2-column row, "Prev | 1/3 | Next" lines up with the grid above it). Rows that are already
-// wider than the common width (long game names) are left alone, nothing is ever shortened. Labels only: callbacks,
-// styles and URLs are untouched, and the classic (non-rich) keyboard is never padded.
-const EVEN_ROW_CAP = 40;
+// Even button rows. Buttons inside a rich message are drawn as pills only as wide as their label, so rows of
+// different label lengths (or 1 / 2 / 3 buttons per row) look ragged. evenRows() pads every label with invisible
+// Braille blanks so that (a) every button in a row is the same width and (b) EVERY row has the same total width,
+// EVEN_ROW_TARGET, which is a little wider than the bubble. Telegram then squeezes each row to exactly the bubble
+// width, so all rows (grid, tabs, Prev | 1/3 | Next, a lone Back / Stop) share one left and one right edge.
+// Only the invisible filler overflows. Labels only: callbacks, styles and URLs are untouched, and the classic
+// (non-rich) keyboard is never padded. Raise EVEN_ROW_TARGET if rows look narrower than the bubble, lower it if
+// label text starts to get clipped.
+const EVEN_ROW_TARGET = 44;
 function evenRows(rows) {
   const ok = (Array.isArray(rows) ? rows : []).filter((r) => Array.isArray(r) && r.length);
   if (!ok.length) return rows;
   const rowW = (r) => Math.max(...r.slice(0, 8).map((b) => visualWidth((b && b.text) || '')));
-  let total = 0;
-  for (const r of ok) { const t = r.slice(0, 8).length * rowW(r); if (t <= EVEN_ROW_CAP) total = Math.max(total, t); }
   return rows.map((r) => {
     if (!Array.isArray(r) || !r.length) return r;
     const n = Math.min(r.length, 8);
-    const w = Math.max(rowW(r), Math.floor(total / n));
+    const w = Math.max(rowW(r), Math.floor(EVEN_ROW_TARGET / n));
     return r.map((b, i) => {
       if (i >= n || !b || typeof b.text !== 'string') return b;
       const gap = w - visualWidth(b.text);
@@ -5813,8 +5813,16 @@ function buyEq(btns, cap = 24) {
     return { ...b, text: BRAILLE_BLANK.repeat(l) + b.text + BRAILLE_BLANK.repeat(gap - l) };
   });
 }
+function buyCut(text, max) {
+  const s = String(text || '');
+  if (visualWidth(s) <= max) return s;
+  let out = '';
+  for (const ch of Array.from(s)) { if (visualWidth(out + ch) > max - 1) break; out += ch; }
+  return out.trimEnd() + '…';
+}
 function buyGrid(btns, cols) {
-  const eq = buyEq(btns);
+  const cap = Math.floor(EVEN_ROW_TARGET / cols) - 2;   // long names are cut with ... so every row stays the same width
+  const eq = buyEq(btns.map((b) => ({ ...b, text: buyCut(b.text, cap) })), cap);
   const rows = [];
   for (let i = 0; i < eq.length; i += cols) rows.push(eq.slice(i, i + cols));
   return rows;
@@ -5908,9 +5916,8 @@ const BUY_TAB_STYLE = { currency: 'success', package: 'primary' };
 const BUY_TAB_FALLBACK = ['danger', 'success', 'primary'];
 function buyTabStyle(t, i) { return BUY_TAB_STYLE[t] || BUY_TAB_FALLBACK[i % BUY_TAB_FALLBACK.length]; }
 
-// ---- catalog: type tabs stay as in-message buttons, the PRICE LIST is its own plain message ---------------
-// buyShowCatalog() edits the card (type tabs + Back + Stop) and keeps the price list in separate text message(s),
-// tracked as flow messages (Stop / success / a new Game List wipe them). The customer types the package number.
+// ---- catalog: type tabs + PACKAGE BUTTONS, all inside one card ---------------------------------------------
+// buyShowCatalog() edits the card (type tabs + one button per package + Back + Stop). The customer taps a package.
 // The open catalog is remembered in telegramBuyLive/{chatId}; the cron tick (refreshLiveBuyCards) re-reads the game
 // and edits the price message(s) in place when an amount / price changed. Any other button tap clears it first.
 const BUY_LIVE_TTL_MS = 30 * 60 * 1000;
@@ -5976,7 +5983,9 @@ function buyPriceTexts(game, tab, list, lang) {
   return chunks.map((c, i) => `${head}${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ''}\n\n${c.join('\n')}`);
 }
 
-// live = null for a customer tap; { pl: [ids] } when the cron tick refreshes the price messages (never sends new ones)
+// live = null for a customer tap; { pl: [ids] } when the cron tick refreshes the card (never sends a new one)
+// Package buttons live INSIDE the card ("86 - 5,500 MMK"): the customer taps the package, nobody types a number.
+const BUY_PKG_BUTTONS_MAX = 60;
 async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live) {
   const b = { mid };
   const game = await buyGetGame(env, gid);
@@ -5989,48 +5998,40 @@ async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live)
   ti = Math.min(Math.max(0, ti), Math.max(0, tabs.length - 1));
   const tab = tabs[ti] || 'currency';
   const list = entries.filter(({ p }) => buyTabOf(p) === tab);
-  const texts = buyPriceTexts(game, tab, list, lang);
-  const sig = kbHash(texts.join('\u0001'));
+  const sig = buyPriceSig(game);
 
   const sess = await getBotSession(env, telegramId);
   const old = sess && sess.step === 'buy_pick' ? buyParse(sess) : null;
   const sameGame = !!old && old.gid === gid;
   if (live && !sameGame) { await buyLiveClear(env, chatId); return null; }   // the customer already moved on
-  let ids = live && Array.isArray(live.pl) && live.pl.length ? live.pl.slice() : (sameGame && Array.isArray(old.pl) ? old.pl.slice() : []);
-  const prevSig = sameGame ? old.sig : '';
+  // separate price-list messages belonged to the old "type the number" layout: remove any that are still around
+  if (!live && sameGame && Array.isArray(old.pl) && old.pl.length) await buyDeleteMsgs(env, chatId, old.pl);
 
-  // price list message(s): edit in place when the count is unchanged, otherwise delete + resend
-  if (!(ids.length === texts.length && prevSig === sig)) {
-    let ok = ids.length > 0 && ids.length === texts.length;
-    for (let k = 0; ok && k < texts.length; k++) ok = await editTelegramMessage(env, chatId, ids[k], texts[k], null);
-    if (!ok) {
-      if (live) { await buyLiveClear(env, chatId); return null; }
-      await buyDeleteMsgs(env, chatId, ids);
-      ids = [];
-      for (const tx of texts) { const id = await sendFlowMessage(env, chatId, tx); if (id) ids.push(id); }
-    }
-  }
-  const mapList = list.map(({ p, i }) => [i, String(p.amount)]);
-
-  if (live) {
-    await buySave(env, telegramId, 'buy_pick', { ...old, pl: ids, sig, list: mapList });
-    await buyLiveSet(env, chatId, mid, gid, ti, buyPriceSig(game), ids);
-    return mid;
-  }
-
-  // the card: type tabs (2 per row, each its own colour, open one marked "•") + Back + Stop
   const rows = [];
   if (tabs.length > 1) buyGrid(tabs.map((t, i) => styled({ text: `${i === ti ? '• ' : ''}${buyTabLabel(game, t)}`, callback_data: `bg:k:${gid}:${i}` }, buyTabStyle(t, i))), 2).forEach((r) => rows.push(r));
+  const pkgBtns = list.slice(0, BUY_PKG_BUTTONS_MAX).map(({ p, i }) => styled({ text: `${p.amount} — ${Number(p.price || 0).toLocaleString()} MMK`, callback_data: `bg:p:${gid}:${i}` }, 'primary'));
+  if (pkgBtns.length % 2 === 1 && pkgBtns.length > 1) pkgBtns.push({ text: '·', callback_data: 'bg:n' });   // keep the last row 2 wide
+  buyGrid(pkgBtns, 2).forEach((r) => rows.push(r));
   rows.push([{ text: bt(lang, 'နောက်သို့', 'Back'), callback_data: `bg:b:${gid}` }, buyStop(lang)]);
   const lines = [`🎮 ${buyGameLabel(game)}`, ''];
   if (tabs.length > 1) lines.push(bt(lang, 'Package အမျိုးအစား ရွေးပါ ↓', 'Pick a package type ↓'), '');
   lines.push(list.length
-    ? bt(lang, `Price List message ကို ကြည့်ပြီး ယူမယ့် Package ရဲ့ နံပါတ် (1–${list.length}) ကို ရိုက်ပို့ပါ`, `Check the price list message, then type the package number (1–${list.length})`)
+    ? bt(lang, 'လိုချင်တဲ့ Package ကို အောက်က ခလုတ်နှိပ်ပြီး ရွေးပါ', 'Tap the package you want below')
     : bt(lang, 'ဒီအမျိုးအစားမှာ Package မရှိသေးပါ။', 'No packages in this type yet.'));
+  const mapList = list.map(({ p, i }) => [i, String(p.amount)]);
+
+  if (live) {
+    const ok = await editTelegramMessage(env, chatId, mid, padBubble(lines.join('\n')), { inline_keyboard: rows });
+    if (!ok) { await buyLiveClear(env, chatId); return null; }
+    await buySave(env, telegramId, 'buy_pick', { ...old, sig, list: mapList, pl: [] });
+    await buyLiveSet(env, chatId, mid, gid, ti, sig, []);
+    return mid;
+  }
+
   const out = await buyShow(env, chatId, b, lines.join('\n'), { inline_keyboard: rows });
   const cardId = out || mid;
-  await buySave(env, telegramId, 'buy_pick', { gid, ti, mid: cardId, pl: ids, sig, list: mapList });
-  await buyLiveSet(env, chatId, cardId, gid, ti, buyPriceSig(game), ids);
+  await buySave(env, telegramId, 'buy_pick', { gid, ti, mid: cardId, pl: [], sig, list: mapList });
+  await buyLiveSet(env, chatId, cardId, gid, ti, sig, []);
   return cardId;
 }
 async function buyEnterCatalog(env, chatId, mid, lang, telegramId, gid) {
@@ -6167,7 +6168,8 @@ async function buyAfterIds(env, chatId, telegramId, b, game, pkg, lang) {
 // ---- package number -> (account check / register) -> quantity -> ID -> name check -> order ----------------
 async function buyPromptQty(env, chatId, telegramId, b, game, pkg, lang, note) {
   await buySave(env, telegramId, 'buy_qty', b);
-  return buyShow(env, chatId, b, `${note ? `${note}\n\n` : ''}${buySummary(lang, game, pkg, 1, null)}\n\n${bt(lang, '🔢 အရေအတွက် ကို နံပါတ်နဲ့ ပို့ပါ (၁ ကနေ ၁၀)', '🔢 Send the quantity as a number (1–10)')}`, { inline_keyboard: [buyBackCancel(lang, `bg:ba:${b.gid}`)] });
+  const qtyRow = BUY_QTY_CHOICES.map((q) => styled({ text: String(q), callback_data: `bg:q:${q}` }, 'primary'));
+  return buyShow(env, chatId, b, `${note ? `${note}\n\n` : ''}${buySummary(lang, game, pkg, 1, null)}\n\n${bt(lang, '🔢 အရေအတွက် ကို ခလုတ်နှိပ်ပြီး ရွေးပါ', '🔢 Tap the quantity')}`, { inline_keyboard: [qtyRow, buyBackCancel(lang, `bg:ba:${b.gid}`)] });
 }
 
 // the customer typed a package number under the price list
@@ -6175,7 +6177,7 @@ async function buyHandlePick(env, chatId, telegramId, b, text, lang) {
   const list = Array.isArray(b.list) ? b.list : [];
   const n = buyParseNum(text);
   if (!(n >= 1 && n <= list.length)) {
-    return sendFlowMessage(env, chatId, bt(lang, `⚠️ Price List ထဲက နံပါတ် (1–${list.length}) ကိုပဲ ရိုက်ပို့ပါ`, `⚠️ Type a number from the price list (1–${list.length})`));
+    return sendFlowMessage(env, chatId, bt(lang, '⚠️ အပေါ်က Package ခလုတ်ကို နှိပ်ပြီး ရွေးပါ', '⚠️ Tap one of the package buttons above'));
   }
   const [pi, amount] = list[n - 1];
   const game = await buyGetGame(env, b.gid);
