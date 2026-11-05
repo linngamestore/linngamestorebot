@@ -684,6 +684,10 @@ const BTN_BRAILLE_PX = 25.1;
 const BTN_SPACE_PX = 8.5;
 const BTN_ROW_PX = 940;
 const BTN_GAP_PX = 20;
+// When a row is wider than the bubble, Telegram shrinks every pill by the SAME amount, taking it from the pill's own
+// padding (measured: 228px -> ~45px in a 3-button row). So a column count fits as long as the label TEXT plus this
+// minimum padding fits its slot; equal natural widths (evenRows) then stay equal after the shrink.
+const BTN_MIN_PAD_PX = 44;
 function glyphEm(cp, ch) {
   if (cp === 0x2800) return BTN_BRAILLE_PX / BTN_FONT_PX;
   if (cp === 32) return 0.25;
@@ -733,14 +737,30 @@ function padLabelPx(text, targetPx) {
   if (br === 0) { sl += sr; sr = 0; }
   return BRAILLE_BLANK.repeat(bl) + ' '.repeat(sl) + text + ' '.repeat(sr) + BRAILLE_BLANK.repeat(br);
 }
-function evenRows(rows) {
+// Neat grid: EVERY row of a keyboard gets the same total width W (so all rows share one left and one right edge) and
+// every button inside a row gets the same share of it (1 button = W, 2 = half each, 3 = a third each ...). W is the
+// smallest width in which every row's widest label still fits (capped at BTN_ROW_PX), so nothing is stretched more
+// than it has to be: a keyboard of short labels stays narrow, one with long names / 2-column rows uses the full width.
+// `widthPx` lets a caller (the tap spinner) keep the width the keyboard already has.
+function evenRowsWidth(rows) {
+  let W = 0;
+  for (const r of Array.isArray(rows) ? rows : []) {
+    if (!Array.isArray(r) || !r.length) continue;
+    const n = Math.min(r.length, 8);
+    const widest = Math.max(...r.slice(0, n).map((b) => BTN_PAD_PX + textPx((b && b.text) || '')));
+    W = Math.max(W, n * widest + (n - 1) * BTN_GAP_PX);
+  }
+  return Math.min(W, BTN_ROW_PX);
+}
+function evenRows(rows, widthPx) {
   if (!Array.isArray(rows)) return rows;
+  const W = Number(widthPx) || evenRowsWidth(rows);
   return rows.map((r) => {
     if (!Array.isArray(r) || !r.length) return r;
     const n = Math.min(r.length, 8);
-    const slot = Math.floor((BTN_ROW_PX - (n - 1) * BTN_GAP_PX) / n);
+    const slot = Math.floor((W - (n - 1) * BTN_GAP_PX) / n);
     const nat = r.slice(0, n).map((b) => BTN_PAD_PX + textPx((b && b.text) || ''));
-    const target = Math.max(slot, ...nat);            // every button of the row gets the same natural width
+    const target = Math.max(slot, ...nat);   // equal inside the row; only wider than its share if a label really needs it
     return r.map((b, i) => (i >= n || !b || typeof b.text !== 'string') ? b : { ...b, text: padLabelPx(b.text, target) });
   });
 }
@@ -1065,8 +1085,10 @@ function startButtonSpinner(token, cb, opts = {}) {
     };
     const call = (n) => {                                // n = frame number, or null = put the original buttons back
       const f = mapBtn(n);
+      // keep the keyboard's current width, so the pressed button does not jump
+      const unit = rich ? evenRowsWidth(rich.blocks.filter(isBtns).map((bl) => bl.buttons)) : 0;
       const body = rich
-        ? { chat_id, message_id, rich_message: { blocks: rich.blocks.map((b) => (isBtns(b) ? { ...b, buttons: evenRows([b.buttons.map(f)])[0] } : b)) } }
+        ? { chat_id, message_id, rich_message: { blocks: rich.blocks.map((b) => (isBtns(b) ? { ...b, buttons: evenRows([b.buttons.map(f)], unit)[0] } : b)) } }
         : { chat_id, message_id, reply_markup: { inline_keyboard: kb.map((row) => row.map(f)) } };
       return fetch(`https://api.telegram.org/bot${token}/${rich ? "editMessageText" : "editMessageReplyMarkup"}`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -5889,10 +5911,10 @@ function buyGrid(btns, cols) {
   const isPh = (b) => b && b.text === '·' && b.callback_data === 'bg:n';
   const real = btns.filter((b) => !isPh(b));
   if (real.length < 2) cols = 1;
-  const widest = Math.max(0, ...real.map((b) => BTN_PAD_PX + textPx(b.text)));
-  while (cols > 1 && widest > buySlotPx(cols)) cols--;
+  const widest = Math.max(0, ...real.map((b) => textPx(b.text)));
+  while (cols > 1 && widest > buySlotPx(cols) - BTN_MIN_PAD_PX) cols--;
   const use = cols === 1 ? real : btns;                 // placeholders only keep a 2-wide last row tidy
-  const cap = buySlotPx(cols) - BTN_PAD_PX;
+  const cap = buySlotPx(cols) - BTN_MIN_PAD_PX;
   const eq = use.map((b) => ({ ...b, text: buyCut(b.text, cap) }));
   const rows = [];
   for (let i = 0; i < eq.length; i += cols) rows.push(eq.slice(i, i + cols));
@@ -6080,23 +6102,14 @@ async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live)
 
   const rows = [];
   if (tabs.length > 1) buyGrid(tabs.map((t, i) => styled({ text: `${i === ti ? '• ' : ''}${buyTabLabel(game, t)}`, callback_data: `bg:k:${gid}:${i}` }, buyTabStyle(t, i))), buyTabCols(tabs.length)).forEach((r) => rows.push(r));
-  // Compact labels ("1050 · 64,350", price in Ks) are tried first so the list can use 2 columns; if even those do
-  // not fit, fall back to one column with the full "1050 — 64,350 Ks" label.
-  const mkPkgBtns = (compact) => list.slice(0, BUY_PKG_BUTTONS_MAX).map(({ p, i }) => styled({
-    text: compact ? `${p.amount} · ${Number(p.price || 0).toLocaleString()}` : `${p.amount} — ${Number(p.price || 0).toLocaleString()} Ks`,
-    callback_data: `bg:p:${gid}:${i}`,
-  }, 'primary'));
-  let pkgBtns = mkPkgBtns(true);
+  const pkgBtns = list.slice(0, BUY_PKG_BUTTONS_MAX).map(({ p, i }) => styled({ text: `${p.amount} — ${Number(p.price || 0).toLocaleString()} Ks`, callback_data: `bg:p:${gid}:${i}` }, 'primary'));
   if (pkgBtns.length % 2 === 1 && pkgBtns.length > 1) pkgBtns.push({ text: '·', callback_data: 'bg:n' });   // keep the last row 2 wide
-  let pkgGrid = buyGrid(pkgBtns, 2);
-  const twoCol = pkgGrid.length > 0 && pkgGrid[0].length > 1;
-  if (!twoCol) pkgGrid = buyGrid(mkPkgBtns(false), 1);
-  pkgGrid.forEach((r) => rows.push(r));
+  buyGrid(pkgBtns, 2).forEach((r) => rows.push(r));
   rows.push([{ text: bt(lang, 'နောက်သို့', 'Back'), callback_data: `bg:b:${gid}` }, buyStop(lang)]);
   const lines = [`🎮 ${buyGameLabel(game)}`, ''];
   if (tabs.length > 1) lines.push(bt(lang, 'Package အမျိုးအစား ရွေးပါ ↓', 'Pick a package type ↓'), '');
   lines.push(list.length
-    ? bt(lang, `လိုချင်တဲ့ Package ကို အောက်က ခလုတ်နှိပ်ပြီး ရွေးပါ${twoCol ? ' (ဈေးနှုန်း Ks)' : ''}`, `Tap the package you want below${twoCol ? ' (prices in Ks)' : ''}`)
+    ? bt(lang, 'လိုချင်တဲ့ Package ကို အောက်က ခလုတ်နှိပ်ပြီး ရွေးပါ', 'Tap the package you want below')
     : bt(lang, 'ဒီအမျိုးအစားမှာ Package မရှိသေးပါ။', 'No packages in this type yet.'));
   const mapList = list.map(({ p, i }) => [i, String(p.amount)]);
 
