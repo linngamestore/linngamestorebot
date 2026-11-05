@@ -694,7 +694,7 @@ const btnIconPx = (b) => (b && (b.url || b.web_app) ? BTN_ICON_PX : 0);
 // When a row is wider than the bubble, Telegram shrinks every pill by the SAME amount, taking it from the pill's own
 // padding (measured: 228px -> ~45px in a 3-button row). So a column count fits as long as the label TEXT plus this
 // minimum padding fits its slot; equal natural widths (evenRows) then stay equal after the shrink.
-const BTN_MIN_PAD_PX = 98;
+const BTN_MIN_PAD_PX = 56;   // real minimum pill padding when Telegram squeezes a row (2 columns of "2195 — 129,150 Ks" must fit)
 function glyphEm(cp, ch) {
   if (cp === 0x2800) return BTN_BRAILLE_PX / BTN_FONT_PX;
   if (cp === 32) return 0.25;
@@ -770,6 +770,7 @@ function btnEm(s) {
     else if (ch === '\u2007') w += 0.556;
     else if (ch === '\u2008') w += 0.278;
     else if (ch === '\u2026' || ch === '\u2014') w += 1;
+    else if (c === 0x2022) w += 0.35;   // bullet
     else if (c === 0x103c) w += 0.6;
     else if (c === 0x103b) w += 0.5;
     else if (c === 0x1031 || c === 0x102c || c === 0x102b || c === 0x1038) w += 0.22;
@@ -6104,24 +6105,32 @@ function buyParseNum(text) {
   return /^[0-9]{1,3}\s*[.)]?$/.test(s) ? parseInt(s, 10) : NaN;
 }
 
-// numbered price list of ONE type tab; split in several messages only if it would pass Telegram's text limit
-function buyPriceTexts(game, tab, list, lang) {
-  const head = `🎮 ${buyGameLabel(game)} · ${buyTabLabel(game, tab)}`;
-  if (!list.length) return [`${head}\n\n${bt(lang, 'Package မရှိသေးပါ။', 'No packages.')}`];
-  const chunks = []; let cur = []; let len = head.length;
-  list.forEach(({ p }, n) => {
-    const ln = `${n + 1}. ${p.amount} — ${Number(p.price || 0).toLocaleString()} Ks`;
-    if (len + ln.length + 1 > BUY_PL_CHUNK && cur.length) { chunks.push(cur); cur = []; len = head.length; }
-    cur.push(ln); len += ln.length + 1;
-  });
-  chunks.push(cur);
-  return chunks.map((c, i) => `${head}${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ''}\n\n${c.join('\n')}`);
-}
-
 // live = null for a customer tap; { pl: [ids] } when the cron tick refreshes the card (never sends a new one)
 // Package buttons live INSIDE the card ("86 - 5,500 Ks"): the customer taps the package, nobody types a number.
 const BUY_PKG_BUTTONS_MAX = 60;
-async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live) {
+const BUY_PRICE_FILTERS = { 1: '≤ 20k', 2: '20k–50k', 3: '50k+' };
+function buyInPriceRange(price, f) { return f === 1 ? price <= 20000 : f === 2 ? price > 20000 && price <= 50000 : f === 3 ? price > 50000 : true; }
+// H: tapping an amount first shows ONE confirm card (package, price, wallet) - Confirm continues the purchase.
+async function buyShowPickConfirm(env, chatId, mid, lang, telegramId, gid, pi) {
+  const game = await buyGetGame(env, gid);
+  const pkg = game && Array.isArray(game.packages) ? game.packages[pi] : null;
+  if (!game || !pkg || typeof pkg !== 'object') return buyStartPurchase(env, chatId, telegramId, mid, lang, gid, pi, '');
+  const price = Number(pkg.price || 0);
+  const entries = buyPkgs(game);
+  const ti = Math.max(0, buyTabs(entries).indexOf(buyTabOf(pkg)));
+  const L = [`🎮 ${buyGameLabel(game)}`, `📦 ${pkg.amount}`, `💰 ${mmk(price)}`];
+  const acct = await lookupAccountByTelegramId(env, telegramId).catch(() => null);
+  if (acct) {
+    const bal = Number(acct.walletBalance) || 0;
+    L.push(`💼 Wallet: ${mmk(bal)}${bal >= price ? ` ➜ ${mmk(bal - price)}` : ''}`);
+  }
+  const text = `${L.join('\n')}\n\n${bt(lang, 'ဝယ်မည်ဆိုရင် Confirm ကို နှိပ်ပါ', 'Tap Confirm to continue')}`;
+  return buyShow(env, chatId, { mid }, text, { inline_keyboard: [
+    [styled({ text: bt(lang, 'Confirm', 'Confirm'), callback_data: `bg:pc:${gid}:${pi}` }, 'success')],
+    [{ text: bt(lang, 'Package ပြန်ရွေး', 'Change package'), callback_data: `bg:kb:${gid}:${ti}` }, buyStop(lang)],
+  ] });
+}
+async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live, view) {
   const b = { mid };
   const game = await buyGetGame(env, gid);
   if (!game) {
@@ -6132,40 +6141,63 @@ async function buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, live)
   const tabs = buyTabs(entries);
   ti = Math.min(Math.max(0, ti), Math.max(0, tabs.length - 1));
   const tab = tabs[ti] || 'currency';
-  const list = entries.filter(({ p }) => buyTabOf(p) === tab);
+  const tabList = entries.filter(({ p }) => buyTabOf(p) === tab);
   const sig = buyPriceSig(game);
 
   const sess = await getBotSession(env, telegramId);
   const old = sess && sess.step === 'buy_pick' ? buyParse(sess) : null;
   const sameGame = !!old && old.gid === gid;
+  // price filter (0 = all) + page: from the tap, or kept from the session when the cron tick refreshes the card
+  const vw = view || (live && sameGame ? { pf: old.pf || 0, pg: old.pg || 0 } : { pf: 0, pg: 0 });
+  const pf = BUY_PRICE_FILTERS[vw.pf] ? vw.pf : 0;
+  const list = pf ? tabList.filter(({ p }) => buyInPriceRange(Number(p.price || 0), pf)) : tabList;
   if (live && !sameGame) { await buyLiveClear(env, chatId); return null; }   // the customer already moved on
   // separate price-list messages belonged to the old "type the number" layout: remove any that are still around
   if (!live && sameGame && Array.isArray(old.pl) && old.pl.length) await buyDeleteMsgs(env, chatId, old.pl);
 
   const rows = [];
   if (tabs.length > 1) buyGrid(tabs.map((t, i) => styled({ text: `${i === ti ? '• ' : ''}${buyTabLabel(game, t)}`, callback_data: `bg:k:${gid}:${i}` }, buyTabStyle(t, i))), buyTabCols(tabs.length)).forEach((r) => rows.push(r));
-  const pkgBtns = list.slice(0, BUY_PKG_BUTTONS_MAX).map(({ p, i }) => styled({ text: `${p.amount} — ${Number(p.price || 0).toLocaleString()} Ks`, callback_data: `bg:p:${gid}:${i}` }, 'primary'));
-  if (pkgBtns.length % 2 === 1 && pkgBtns.length > 1) pkgBtns.push({ text: '·', callback_data: 'bg:n' });   // keep the last row 2 wide
-  buyGrid(pkgBtns, 2).forEach((r) => rows.push(r));
+  // price-range chips (only when the tab has enough packages); tapping the chosen chip clears the filter
+  if (tabList.length > 6) {
+    const chips = [];
+    for (let f = 1; f <= 3; f++) {
+      const n = tabList.filter(({ p }) => buyInPriceRange(Number(p.price || 0), f)).length;
+      if (!n && f !== pf) continue;
+      chips.push(styled({ text: `${f === pf ? '• ' : ''}${BUY_PRICE_FILTERS[f]}`, callback_data: `bg:f:${gid}:${ti}:${f === pf ? 0 : f}:0` }, f === pf ? 'success' : undefined));
+    }
+    if (chips.length > 1 || pf) buyGrid(chips, chips.length).forEach((r) => rows.push(r));
+  }
+  // amount-only buttons (price is shown on the confirm card): 3 per row, fewer if a label is too long, paged
+  const amountBtns = list.map(({ p, i }) => ({ text: String(p.amount), callback_data: `bg:p:${gid}:${i}`, style: 'primary' }));
+  const fitsCols = (c) => amountBtns.every((x) => textPx(x.text) <= buySlotPx(c) - BTN_MIN_PAD_PX);
+  const pcols = amountBtns.length < 2 ? 1 : fitsCols(3) ? 3 : fitsCols(2) ? 2 : 1;
+  const perPage = pcols === 3 ? 9 : pcols === 2 ? 8 : 6;
+  const pages = Math.max(1, Math.ceil(amountBtns.length / perPage));
+  const pg = Math.min(Math.max(0, vw.pg || 0), pages - 1);
+  const pageBtns = amountBtns.slice(pg * perPage, pg * perPage + perPage);
+  while (pcols > 1 && pageBtns.length % pcols) pageBtns.push({ text: '·', callback_data: 'bg:n' });
+  if (pageBtns.length) buyGrid(pageBtns, pcols).forEach((r) => rows.push(r));
+  const navRow = buyNav(lang, pg, pages, (n) => `bg:f:${gid}:${ti}:${pf}:${n}`);
+  if (navRow) rows.push(navRow);
   rows.push([{ text: bt(lang, 'နောက်သို့', 'Back'), callback_data: `bg:b:${gid}` }, buyStop(lang)]);
   const lines = [`🎮 ${buyGameLabel(game)}`, ''];
   if (tabs.length > 1) lines.push(bt(lang, 'Package အမျိုးအစား ရွေးပါ ↓', 'Pick a package type ↓'), '');
   lines.push(list.length
-    ? bt(lang, 'လိုချင်တဲ့ Package ကို အောက်က ခလုတ်နှိပ်ပြီး ရွေးပါ', 'Tap the package you want below')
-    : bt(lang, 'ဒီအမျိုးအစားမှာ Package မရှိသေးပါ။', 'No packages in this type yet.'));
+    ? bt(lang, 'လိုချင်တဲ့ ပမာဏကို နှိပ်ပါ (ဈေးကို နောက်အဆင့်မှာ ပြပါမယ်)', 'Tap the amount you want (the price shows on the next step)')
+    : (pf ? bt(lang, 'ဒီဈေးအပိုင်းမှာ Package မရှိပါ။', 'No packages in this price range.') : bt(lang, 'ဒီအမျိုးအစားမှာ Package မရှိသေးပါ။', 'No packages in this type yet.')));
   const mapList = list.map(({ p, i }) => [i, String(p.amount)]);
 
   if (live) {
     const ok = await editTelegramMessage(env, chatId, mid, padBubble(lines.join('\n')), { inline_keyboard: rows });
     if (!ok) { await buyLiveClear(env, chatId); return null; }
-    await buySave(env, telegramId, 'buy_pick', { ...old, sig, list: mapList, pl: [] });
+    await buySave(env, telegramId, 'buy_pick', { ...old, sig, list: mapList, pl: [], pf, pg });
     await buyLiveSet(env, chatId, mid, gid, ti, sig, []);
     return mid;
   }
 
   const out = await buyShow(env, chatId, b, lines.join('\n'), { inline_keyboard: rows });
   const cardId = out || mid;
-  await buySave(env, telegramId, 'buy_pick', { gid, ti, mid: cardId, pl: [], sig, list: mapList });
+  await buySave(env, telegramId, 'buy_pick', { gid, ti, mid: cardId, pl: [], sig, list: mapList, pf, pg });
   await buyLiveSet(env, chatId, cardId, gid, ti, sig, []);
   return cardId;
 }
@@ -6621,9 +6653,13 @@ async function handleBuyCallback(env, cq, ctx) {
     if (kind === 'k') {
       const sess = await getBotSession(env, telegramId);
       const cur = sess && sess.step === 'buy_pick' ? buyParse(sess) : null;
-      if (cur && cur.gid === gid && cur.mid === mid && (cur.ti || 0) === ti) return;   // that tab is already open
+      if (cur && cur.gid === gid && cur.mid === mid && (cur.ti || 0) === ti && !cur.pf && !cur.pg) return;   // that tab is already open (no filter / page)
     }
     return buyShowCatalog(env, chatId, mid, lang, telegramId, gid, ti, null);
+  }
+  if (kind === 'f') {   // price filter chip / page row: bg:f:<gid>:<tab>:<filter>:<page>
+    await answerCallbackQuery(env, cq.id);
+    return buyShowCatalog(env, chatId, mid, lang, telegramId, parts[2], num(parts[3]), null, { pf: num(parts[4]), pg: num(parts[5]) });
   }
   if (kind === 'b' || kind === 'ba') {
     await answerCallbackQuery(env, cq.id);
@@ -6674,6 +6710,10 @@ async function handleBuyCallback(env, cq, ctx) {
 
   // ----- package chosen (old price-list buttons that are still on screen keep working) -----
   if (kind === 'p') {
+    await answerCallbackQuery(env, cq.id);
+    return buyShowPickConfirm(env, chatId, mid, lang, telegramId, parts[2], num(parts[3]));
+  }
+  if (kind === 'pc') {
     await answerCallbackQuery(env, cq.id);
     return buyStartPurchase(env, chatId, telegramId, mid, lang, parts[2], num(parts[3]), '');
   }
