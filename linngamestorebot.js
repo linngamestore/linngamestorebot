@@ -219,6 +219,12 @@ export default {
       if (request.method === 'POST' && url.pathname === '/auth/widget') {
         return await handleWidget(request, env, corsHeaders, ctx);
       }
+      if (request.method === 'POST' && url.pathname === '/auth/tg-start') {
+        return await handleTgLoginStart(request, env, corsHeaders);
+      }
+      if (request.method === 'POST' && url.pathname === '/auth/tg-poll') {
+        return await handleTgLoginPoll(request, env, corsHeaders, ctx);
+      }
       if (request.method === 'POST' && url.pathname === '/notify-connected') {
         return await handleNotifyConnected(request, env, corsHeaders);
       }
@@ -363,6 +369,108 @@ async function handleWidget(request, env, corsHeaders, ctx) {
   await autoLinkTelegramGuest(env, tgUser, widgetGuestId);
   if (ctx) ctx.waitUntil(sendLoginWelcome(env, tgUser));
 
+  const token = await mintFirebaseToken(env, tgUser);
+  return json({ token, user: tgUser }, 200, corsHeaders);
+}
+
+// ---------------------------------------------------------------------------
+// Bot login (no phone number). The website gets a one-time code + a private pollKey, the customer taps
+// START on t.me/<bot>?start=login_<code>, the webhook marks the code approved with the VERIFIED sender
+// (msg.from, signed by Telegram), and only the browser that holds the pollKey can swap it for a token.
+// Docs live in Firestore `tgLogins/{code}` (service account only - client rules never expose it).
+// Optional: add a Firestore TTL policy on the `expireAt` field so abandoned codes clean themselves up.
+// ---------------------------------------------------------------------------
+const TG_LOGIN_TTL_MS = 5 * 60 * 1000;
+const TG_LOGIN_BOT = 'linngamestorebot';
+
+function randB64u(nBytes) {
+  const a = crypto.getRandomValues(new Uint8Array(nBytes));
+  let bin = '';
+  for (let i = 0; i < a.length; i++) bin += String.fromCharCode(a[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+async function sha256HexStr(str) {
+  const d = new Uint8Array(await sha256Raw(strToBuf(str)));
+  let h = '';
+  for (let i = 0; i < d.length; i++) h += d[i].toString(16).padStart(2, '0');
+  return h;
+}
+
+async function handleTgLoginStart(request, env, corsHeaders) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  if (await isRateLimited(env, 'ip_' + ip, 'tgstart', { maxCount: 15, windowMs: 10 * 60 * 1000 })) {
+    return json({ error: 'Too many tries' }, 429, corsHeaders);
+  }
+  const body = (await safeJson(request)) || {};
+  const gid = typeof body.guestId === 'string' && /^[A-Za-z0-9_-]{3,64}$/.test(body.guestId) ? body.guestId : '';
+  const code = randB64u(18);      // 24 chars, goes in the t.me link
+  const pollKey = randB64u(24);   // stays in the browser only
+  await fsSetDoc(env, `tgLogins/${code}`, {
+    status: 'pending',
+    pollHash: await sha256HexStr(pollKey),
+    guestId: gid,
+    createdAt: Date.now(),
+    expireAt: new Date(Date.now() + TG_LOGIN_TTL_MS),
+  });
+  const link = `https://t.me/${TG_LOGIN_BOT}?start=login_${code}`;
+  return json({ code, pollKey, link, expiresIn: Math.floor(TG_LOGIN_TTL_MS / 1000) }, 200, corsHeaders);
+}
+
+// Called from the webhook when the customer taps START on the login link.
+async function handleTgLoginApprove(env, msg, code, lang) {
+  const chatId = msg.chat.id;
+  const from = msg.from || {};
+  const my = lang !== 'en';
+  try {
+    const f = await fsGetFields(env, `tgLogins/${code}`);
+    const fresh = f && fsField(f, 'status') === 'pending' && Date.now() - Number(fsField(f, 'createdAt') || 0) < TG_LOGIN_TTL_MS;
+    if (!fresh) {
+      return sendTelegramMessage(env, chatId, my ? '⌛ Link သက်တမ်းကုန်ပါပြီ။ Store မှာ ပြန်နှိပ်ပါ။' : '⌛ Link expired. Try again in the store.');
+    }
+    await fsMergeDoc(env, `tgLogins/${code}`, {
+      status: 'ok',
+      tgId: String(from.id),
+      firstName: from.first_name || '',
+      lastName: from.last_name || '',
+      username: from.username || '',
+    });
+    try { await trackBotUser(env, String(from.id), chatId, from); } catch (e) { /* best-effort */ }
+    return sendTelegramMessage(env, chatId, my ? '✅ ဝင်ပြီးပါပြီ။ Store ကို ပြန်သွားပါ။' : '✅ Logged in. Go back to the store.', MAIN_KEYBOARD);
+  } catch (e) {
+    console.error('tg login approve failed:', e);
+    return sendTelegramMessage(env, chatId, my ? '⚠️ မအောင်မြင်ပါ။ ပြန်စမ်းပါ။' : '⚠️ Failed. Please retry.');
+  }
+}
+
+async function handleTgLoginPoll(request, env, corsHeaders, ctx) {
+  const body = await safeJson(request);
+  const code = body && typeof body.code === 'string' ? body.code : '';
+  const pollKey = body && typeof body.pollKey === 'string' ? body.pollKey : '';
+  if (!/^[A-Za-z0-9_-]{16,64}$/.test(code) || !pollKey) return json({ error: 'Bad request' }, 400, corsHeaders);
+
+  const f = await fsGetFields(env, `tgLogins/${code}`);
+  if (!f) return json({ error: 'expired' }, 404, corsHeaders);
+  const age = Date.now() - Number(fsField(f, 'createdAt') || 0);
+  if (age > TG_LOGIN_TTL_MS) {
+    await fsDeleteDoc(env, `tgLogins/${code}`);
+    return json({ error: 'expired' }, 410, corsHeaders);
+  }
+  if (!timingSafeEqualHex(await sha256HexStr(pollKey), String(fsField(f, 'pollHash') || ''))) {
+    return json({ error: 'Forbidden' }, 403, corsHeaders);
+  }
+  if (fsField(f, 'status') !== 'ok') return json({ pending: true }, 200, corsHeaders);
+
+  // One use only.
+  await fsDeleteDoc(env, `tgLogins/${code}`);
+  const tgUser = {
+    id: fsField(f, 'tgId'),
+    first_name: fsField(f, 'firstName') || undefined,
+    last_name: fsField(f, 'lastName') || undefined,
+    username: fsField(f, 'username') || undefined,
+  };
+  if (!tgUser.id) return json({ error: 'Login failed' }, 401, corsHeaders);
+  if (ctx) ctx.waitUntil(notifyAdminNewTelegramUser(env, tgUser, 'Bot Login'));
+  await autoLinkTelegramGuest(env, tgUser, fsField(f, 'guestId') || '');
   const token = await mintFirebaseToken(env, tgUser);
   return json({ token, user: tgUser }, 200, corsHeaders);
 }
@@ -1777,24 +1885,24 @@ const MESSAGES = {
     en: "Please slow down a bit 🙏 That's a lot of messages — try again shortly.",
   },
   welcomeBack: {
-    my: (name) => `👋 မင်္ဂလာပါ ${name}\n\n🎮 Linn Game Store မှ ပြန်လည်ကြိုဆိုပါတယ်\nGame Top Up နဲ့ Voucher ကို ဒီ Chat ထဲကနေ ဝယ်လို့ရပါတယ်။\n\n👇 အောက်က Menu ကနေ ရွေးလိုက်ပါ\n\n` + quoteBlock('💡 Game ဝယ်ဖို့ Wallet ထဲမှာ ငွေရှိရပါမယ်။\nမရှိသေးရင် 💼 Wallet → ➕ Top Up Wallet ကနေ အရင်ဖြည့်ပါ။'),
-    en: (name) => `👋 Welcome back, ${name}\n\n🎮 Linn Game Store\nYou can buy game top-ups and vouchers right here.\n\n👇 Pick something from the menu below\n\n` + quoteBlock("💡 You'll need money in your Wallet to buy games.\nIf it's empty, open 💼 Wallet → ➕ Top Up Wallet."),
+    my: (name) => `👋 မင်္ဂလာပါ ${name}\n\n👇 Menu ကနေ ရွေးပါ\n\n` + quoteBlock('💡 ဝယ်ဖို့ Wallet ထဲ ငွေရှိရမယ်။ 💼 Wallet → ➕ Top Up Wallet'),
+    en: (name) => `👋 Welcome back, ${name}\n\n👇 Pick from the menu\n\n` + quoteBlock('💡 You need Wallet funds to buy. 💼 Wallet → ➕ Top Up Wallet'),
   },
   welcomeNew: {
-    my: '👋 မင်္ဂလာပါ\n\n🎮 Linn Game Store မှ ကြိုဆိုပါတယ်\nGame Top Up နဲ့ Voucher ကို ဒီ Chat ထဲကနေ ဝယ်လို့ရပါတယ်။\n\n👤 စသုံးဖို့ Account လိုပါတယ်၊ လုပ်နည်းကို အောက်မှာ ပို့ထားပါတယ် 👇',
-    en: '👋 Welcome\n\n🎮 Linn Game Store\nYou can buy game top-ups and vouchers right here.\n\n👤 You need an account to get started. The steps are right below 👇',
+    my: '👋 မင်္ဂလာပါ\n\n🎮 Linn Game Store\n👤 စသုံးဖို့ Account လိုပါတယ် 👇',
+    en: '👋 Welcome\n\n🎮 Linn Game Store\n👤 You need an account to start 👇',
   },
   loginHint: {
-    my: '👤 စသုံးဖို့ နည်းလမ်း ၂ ခု ရှိပါတယ်\n\n🅰️ Store ကို မဝင်ချင်ရင် — အောက်က "Bot ထဲမှာ Account ဖွင့်မည်" ကို နှိပ်ရုံပါပဲ (Telegram အချက်အလက်နဲ့ ချက်ချင်း ဖွင့်ပေးပါမယ်)\n🅱️ Store မှာပါ သုံးချင်ရင် — "Open Linn Game Store" → "Log in with Telegram" → ဒီ Chat ပြန်လာပြီး /start ပို့\n\n' + quoteBlock('Password မလိုပါဘူး၊ Telegram နဲ့ပဲ ဖြစ်ပါတယ်။'),
-    en: '👤 Two ways to get started\n\n🅰️ Don\'t want to open the store? Just tap "Create account in the bot" below (made instantly from your Telegram details)\n🅱️ Want the store too? "Open Linn Game Store" → "Log in with Telegram" → come back here and send /start\n\n' + quoteBlock('No password needed. It all works with Telegram.'),
+    my: '👤 ဝင်နည်း ၂ ခု\n\n🅰️ "Bot ထဲမှာ Account ဖွင့်မည်" ကို နှိပ်ပါ\n🅱️ Store မှာ "Log in with Telegram" နှိပ်ပြီး START နှိပ်ပါ\n\n' + quoteBlock('Password မလိုပါ။'),
+    en: '👤 Two ways in\n\n🅰️ Tap "Create account in the bot"\n🅱️ In the store tap "Log in with Telegram", then START\n\n' + quoteBlock('No password needed.'),
   },
   help: {
     my: '💬 အကူအညီ\n\nMenu ခလုတ်တွေက ဒီလိုပါ:\n💼 Wallet — လက်ကျန်ငွေ ကြည့်မယ်၊ ➕ Top Up Wallet နဲ့ ငွေဖြည့်မယ်\n📦 My Orders — Order အခြေအနေ ကြည့်မယ်\n👤 My Account — Account အချက်အလက်\n💬 Help Center — မေးခွန်းတွေ၊ Support\n🌐 Language — ဘာသာစကား ပြောင်းမယ်\n📱 Official Mini App — Game ရွေးဝယ်မယ်\n\n' + quoteBlock('/start — Menu ပြန်ခေါ်မယ်\n/cancel — လုပ်နေတာ ရပ်မယ်') + '\n\nအသစ်ဆိုရင် Help Center → ❓ FAQ ကို အရင်ဖတ်ကြည့်ပါ။',
     en: '💬 Help\n\nWhat the menu buttons do:\n💼 Wallet — check your balance, tap ➕ Top Up Wallet to add money\n📦 My Orders — see your order status\n👤 My Account — your account info\n💬 Help Center — FAQ and Support\n🌐 Language — switch language\n📱 Official Mini App — browse and buy games\n\n' + quoteBlock('/start — show the menu again\n/cancel — stop what you are doing') + '\n\nNew here? Start with Help Center → ❓ FAQ.',
   },
   notConnected: {
-    my: '👤 ဒါကို သုံးဖို့ Account လိုပါတယ်\n\n🅰️ "Bot ထဲမှာ Account ဖွင့်မည်" ကို နှိပ်ရင် ချက်ချင်း ရပါပြီ (Store မဝင်ရပါ)\n🅱️ ဒါမှမဟုတ် "Open Linn Game Store" → "Log in with Telegram" → ဒီ Chat ပြန်လာပြီး /start ပို့\n\n' + quoteBlock('မရှင်းရင် 💬 Help Center → ❓ FAQ မှာ ဖတ်လို့ရပါတယ်။'),
-    en: '👤 You need an account to use this\n\n🅰️ Tap "Create account in the bot" — instant, no store login\n🅱️ Or "Open Linn Game Store" → "Log in with Telegram" → come back here and send /start\n\n' + quoteBlock('Need more help? See 💬 Help Center → ❓ FAQ.'),
+    my: '👤 Account လိုပါတယ်\n\n🅰️ "Bot ထဲမှာ Account ဖွင့်မည်" ကို နှိပ်ပါ\n🅱️ ဒါမှမဟုတ် Store မှာ "Log in with Telegram"\n\n' + quoteBlock('မရှင်းရင် 💬 Help Center → ❓ FAQ'),
+    en: '👤 You need an account\n\n🅰️ Tap "Create account in the bot"\n🅱️ Or "Log in with Telegram" in the store\n\n' + quoteBlock('Need help? 💬 Help Center → ❓ FAQ'),
   },
   wallet: {
     my: (balance) => `💼 Wallet\n\nလက်ကျန်ငွေ: ${balance} Ks`,
@@ -2182,6 +2290,12 @@ async function routeTelegramMessage(env, msg) {
   ]);
   if (limited) {
     return sendTelegramMessage(env, chatId, t(lang, 'flooded'));
+  }
+
+  // Website "Login with Telegram" without a phone number: t.me/<bot>?start=login_<code>
+  {
+    const lm = /^\/start(?:@\w+)?\s+login_([A-Za-z0-9_-]{16,64})$/.exec(text);
+    if (lm) return handleTgLoginApprove(env, msg, lm[1], lang);
   }
 
   if (text === '/language') {
